@@ -82,8 +82,6 @@ Optional CMake flags: `-DPERF_LOG=ON` writes frame timings and loading stalls to
 - elliencode for [FalsoNDK](https://github.com/elliencode/FalsoNDK) and the [NBA Jam port](https://github.com/elliencode/nba-jam-psv), used as reference.
 - bythos14 for [kubridge](https://github.com/bythos14/kubridge).
 
-*He-Man* and *Masters of the Universe* are trademarks of Mattel. This project is not affiliated with or endorsed by Mattel or the game's publisher, and it doesn't include any game files.
-
 ## License
 
 The port's code is released under the MIT license (see [LICENSE](LICENSE)), like the boilerplate it is based on. Bundled libraries keep their own licenses (vitaGL: LGPL-3.0, see `lib/vitagl/COPYING*`).
