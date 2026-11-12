@@ -52,7 +52,7 @@ In order to properly install the game, you'll have to follow these steps precise
 ```
 
 - Install `libshacccg.suprx`, if you don't have it already, by following [this guide](https://samilops2.gitbook.io/vita-troubleshooting-guide/shader-compiler/extract-libshacccg.suprx).
-- Obtain your copy of *He-Man: The Most Powerful Game in the Universe* legally for Android in form of an `.apk` file and an obb (`main.obb`). [You can get all the required files directly from your phone](https://stackoverflow.com/questions/11012976/how-do-i-get-the-apk-of-an-installed-app-without-root-access) or by using an apk extractor you can find in the play store.
+- Obtain your copy of *He-Man: The Most Powerful Game in the Universe v1.0.3* legally for Android in form of an `.apk` file and an obb (`main.obb`). [You can get all the required files directly from your phone](https://stackoverflow.com/questions/11012976/how-do-i-get-the-apk-of-an-installed-app-without-root-access) or by using an apk extractor you can find in the play store.
 - Open the apk with your zip explorer and extract `lib/armeabi-v7a/libnative-activity.so` to `ux0:data/heman`.
 - From the same apk, extract the `assets` folder to `ux0:data/heman` (so you get `ux0:data/heman/assets`).
 - The obb is a zip file too: open it with your zip explorer (eg. 7-Zip) and extract all its content in `ux0:data/heman` (so you get `ux0:data/heman/screen-large`, `ux0:data/heman/sounds`, ...).
