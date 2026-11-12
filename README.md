@@ -1,60 +1,34 @@
-<h1 align="center">He-Man: The Most Powerful Game in the Universe — PS Vita Port</h1>
+# He-Man Vita
+
+<p align="center"><img src="./docs/screenshots/title.jpg"></p>
+
+This is a wrapper/port of <b>He-Man: The Most Powerful Game in the Universe</b> for the *PS Vita*.
+
+The port works by loading the official Android ARMv7 executables in memory, resolving its imports with native functions and patching it in order to properly run.
+By doing so, it's basically as if we emulate a minimalist Android environment in which we run natively the executable as is.
 
 <p align="center">
-  <img src="docs/screenshots/title.jpg" width="49%">
-  <img src="docs/screenshots/screenshot1.jpg" width="49%">
-  <img src="docs/screenshots/screenshot2.jpg" width="49%">
-  <img src="docs/screenshots/screenshot3.jpg" width="49%">
+  <img src="./docs/screenshots/screenshot1.jpg" width="32%">
+  <img src="./docs/screenshots/screenshot2.jpg" width="32%">
+  <img src="./docs/screenshots/screenshot3.jpg" width="32%">
 </p>
 
-A wrapper/port of the Android version of *He-Man: The Most Powerful Game in the
-Universe* for the PlayStation Vita. It loads the game's original ARMv7 native
-library (`libnative-activity.so`) and runs it natively on the Vita, with the
-Android APIs it needs reimplemented on top of the Vita's own (vitaGL for
-OpenGL ES, a fake JVM/JNI, NDK shims, etc.).
+## Changelog
 
-This repository contains **no game files**. You need your own legally
-obtained copy of the Android game.
+### v.1.0
 
-**Español:** port de la versión Android de *He-Man: The Most Powerful Game in
-the Universe* para PS Vita. No incluye archivos del juego: necesitas tu propia
-copia. Las instrucciones de instalación están más abajo.
+- Initial release.
+- Physical controls: left stick / D-pad to move, face buttons mapped to the game's touch actions and R for "I Have The Power".
+- Game runs locked at 60 FPS (the game's own frame timer was patched, it was running at 58.8 FPS out of sync with the display).
+- Greatly reduced loading times (about a third of the original) thanks to RAM file caches, an optional asset pack and faster reading of the game's data files.
+- Fixed crashes that don't happen on Android (music streaming race when leaving a level, overflow in the engine's string buffers).
 
-## Features
+## Notes and Tips
 
-- Runs at a steady 60 fps on real hardware
-- Physical controls: left stick / D-pad to move, face buttons mapped to the
-  game's touch actions, **R** for "I Have The Power"; remappable in
-  `ux0:data/heman/controls.txt`
-- Fast loading: assets are served from RAM caches and an optional asset pack
-  (`heman.pak`), level loads take about a third of the original time
-- Fixes for crashes not seen on Android (music streaming race, buffer overflow
-  in the engine's string buffers)
+- Controls can be remapped by editing `ux0:data/heman/controls.txt`, which is created on first launch. Each line binds a button to a touch on the 960x544 screen: `<BUTTON> tap x y`, `<BUTTON> swipe x1 y1 x2 y2` or `<BUTTON> ihtp` (I Have The Power).
+- Default controls:
 
-## Installation
-
-1. Install [kubridge](https://github.com/bythos14/kubridge/releases) (add
-   `ur0:tai/kubridge.skprx` under `*KERNEL` in `ur0:tai/config.txt`) and reboot.
-2. Get the Android game (APK + OBB expansion file `main.obb`).
-3. From the APK (it's a zip), copy `lib/armeabi-v7a/libnative-activity.so` to
-   `ux0:data/heman/libnative-activity.so`.
-4. Extract the contents of `main.obb` (also a zip) into `ux0:data/heman/`, so
-   you end up with `ux0:data/heman/screen-large/`, `ux0:data/heman/sounds/`, …
-5. Copy the APK's `assets/` folder to `ux0:data/heman/assets/`.
-6. *(Recommended, much faster loading)* build the asset pack on your PC and
-   copy it next to the other files:
-   ```sh
-   python3 tools/make_pak.py main.obb heman.pak
-   # copy heman.pak to ux0:data/heman/heman.pak
-   ```
-   Keep the extracted files too: the pack only holds files up to 256 KB and the
-   port falls back to the loose files for everything else. Rebuild the pack if
-   you ever change `main.obb`.
-7. Install `heman.vpk` with VitaShell.
-
-### Controls
-
-| Vita | Action (touch gesture it emulates) |
+| Vita | Action |
 |---|---|
 | Left stick / D-pad | Move |
 | Cross | Swipe up (jump) |
@@ -64,55 +38,52 @@ copia. Las instrucciones de instalación están más abajo.
 | R | I Have The Power |
 | Start | Top-left on-screen button (pause) |
 
-The file `ux0:data/heman/controls.txt` is created on first launch and can be
-edited (`<BUTTON> tap x y`, `<BUTTON> swipe x1 y1 x2 y2`, `<BUTTON> ihtp`,
-screen is 960x544).
+- The asset pack `heman.pak` is optional, but without it loading takes noticeably longer.
 
-## Building
+## Setup Instructions (For End Users)
 
-Requirements: [VitaSDK (softfp)](https://github.com/vitasdk-softfp) with the
-`VITASDK` environment variable set.
+In order to properly install the game, you'll have to follow these steps precisely:
 
-```sh
-mkdir build && cd build
-cmake ..
-make -j8
+- Install [kubridge](https://github.com/bythos14/kubridge/releases/) by copying `kubridge.skprx` to your taiHEN plugins folder (usually `ux0:tai`) and adding an entry to your `config.txt` under `*KERNEL`:
+
+```
+  *KERNEL
+  ux0:tai/kubridge.skprx
 ```
 
-Useful CMake options:
+- Install `libshacccg.suprx`, if you don't have it already, by following [this guide](https://samilops2.gitbook.io/vita-troubleshooting-guide/shader-compiler/extract-libshacccg.suprx).
+- Obtain your copy of *He-Man: The Most Powerful Game in the Universe* legally for Android in form of an `.apk` file and an obb (`main.obb`). [You can get all the required files directly from your phone](https://stackoverflow.com/questions/11012976/how-do-i-get-the-apk-of-an-installed-app-without-root-access) or by using an apk extractor you can find in the play store.
+- Open the apk with your zip explorer and extract `lib/armeabi-v7a/libnative-activity.so` to `ux0:data/heman`.
+- From the same apk, extract the `assets` folder to `ux0:data/heman` (so you get `ux0:data/heman/assets`).
+- The obb is a zip file too: open it with your zip explorer (eg. 7-Zip) and extract all its content in `ux0:data/heman` (so you get `ux0:data/heman/screen-large`, `ux0:data/heman/sounds`, ...).
+- **Optional (recommended)**: Create the asset pack for faster loading. On your PC, with [Python 3](https://www.python.org/downloads/) installed, run `python3 tools/make_pak.py main.obb heman.pak` from this repository and copy `heman.pak` to `ux0:data/heman`. Keep the files extracted in the previous step, they are still needed. If you ever change your obb, create the pack again.
+- Install the `heman.vpk` from the Release page.
 
-| Option | Default | Description |
-|---|---|---|
-| `PERF_LOG` | OFF | Write frame timings and load stalls to `ux0:data/heman/perf.txt` |
-| `HEAP_WATCH` | OFF | Heap corruption checks (slow, debugging only) |
-| `MSAA_4X` | OFF | 4x MSAA (costs GPU time) |
+## Build Instructions (For Developers)
 
-The libraries in `lib/` (so_util, FalsoJNI, FalsoNDK, vitaGL) are included
-directly instead of as submodules because they carry small fixes needed by
-this port.
+In order to build the loader, you'll need a [vitasdk](https://github.com/vitasdk) build fully compiled with softfp usage.
+
+The required libraries ([so_util](https://github.com/Rinnegatamante/so_util), [FalsoJNI](https://github.com/v-atamanenko/FalsoJNI), [FalsoNDK](https://github.com/elliencode/FalsoNDK) and [vitaGL](https://github.com/Rinnegatamante/vitaGL)) are included in the `lib` folder with the small fixes this port needs, and vitaGL is built automatically.
+
+After all these requirements are met, you can compile the loader with the following commands:
+
+```bash
+mkdir build && cd build
+cmake .. && make
+```
+
+Optional CMake flags: `-DPERF_LOG=ON` writes frame timings and loading stalls to `ux0:data/heman/perf.txt`, `-DHEAP_WATCH=ON` enables heap corruption checks (slow) and `-DMSAA_4X=ON` enables 4x MSAA.
 
 ## Credits
 
-This port is built on
-**[soloader-boilerplate (SoLoBoP)](https://github.com/v-atamanenko/soloader-boilerplate)**
-by **Volodymyr Atamanenko (gl33ntwine)**, the starter kit for Android-to-PS Vita
-ports this project was created from. Thank you!
+- gl33ntwine (Volodymyr Atamanenko) for [soloader-boilerplate](https://github.com/v-atamanenko/soloader-boilerplate), the base this port was built on, and for [FalsoJNI](https://github.com/v-atamanenko/FalsoJNI).
+- TheFloW for the original .so loader.
+- Rinnegatamante for [so_util](https://github.com/Rinnegatamante/so_util) and [vitaGL](https://github.com/Rinnegatamante/vitaGL).
+- elliencode for [FalsoNDK](https://github.com/elliencode/FalsoNDK) and the [NBA Jam port](https://github.com/elliencode/nba-jam-psv), used as reference.
+- bythos14 for [kubridge](https://github.com/bythos14/kubridge).
 
-Also thanks to:
-
-- **Andy Nguyen (TheFloW)** – original so_loader / so_util and FIOS helper
-- **Rinnegatamante** – [so_util](https://github.com/Rinnegatamante/so_util) and [vitaGL](https://github.com/Rinnegatamante/vitaGL)
-- **Volodymyr Atamanenko (gl33ntwine)** – [FalsoJNI](https://github.com/v-atamanenko/FalsoJNI)
-- **elliencode** – [FalsoNDK](https://github.com/elliencode/FalsoNDK) and the [NBA Jam port](https://github.com/elliencode/nba-jam-psv), used as reference
-- **bythos14** – [kubridge](https://github.com/bythos14/kubridge)
-- The VitaSDK team and the PS Vita homebrew community
-
-*He-Man* and *Masters of the Universe* are trademarks of Mattel. The game was
-published by Chillingo. This project is not affiliated with or endorsed by
-them.
+*He-Man* and *Masters of the Universe* are trademarks of Mattel. This project is not affiliated with or endorsed by Mattel or the game's publisher, and it doesn't include any game files.
 
 ## License
 
-The port's code is released under the MIT license (see [LICENSE](LICENSE)),
-like the boilerplate it is based on. Bundled libraries keep their own licenses
-(vitaGL: LGPL-3.0, see `lib/vitagl/COPYING*`).
+The port's code is released under the MIT license (see [LICENSE](LICENSE)), like the boilerplate it is based on. Bundled libraries keep their own licenses (vitaGL: LGPL-3.0, see `lib/vitagl/COPYING*`).
