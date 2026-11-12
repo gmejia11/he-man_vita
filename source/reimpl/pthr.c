@@ -18,6 +18,9 @@
 
 #include "utils/utils.h"
 #include "utils/logger.h"
+#include <so_util/so_util.h>
+
+extern so_module so_mod;
 
 #define PTHR_MAX_OBJECTS 1024
 
@@ -182,6 +185,9 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
         ret = pthread_create(thread, attr->real_ptr, start, param);
     }
 
+    // Log every thread the game starts, as an offset into the .so for addr2line/objdump
+    sceClibPrintf("[pthread] create start=so+0x%x param=%p -> %d\n",
+                  (unsigned)((uintptr_t)start - so_mod.text_base), param, ret);
     return ret;
 }
 

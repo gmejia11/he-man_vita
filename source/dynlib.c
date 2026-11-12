@@ -59,6 +59,7 @@
 
 #ifdef NDK_PORT
 #include <falso_ndk/FalsoNDK.h>
+#include <psp2/kernel/processmgr.h>
 #endif
 
 const unsigned int __page_size = PAGE_SIZE;
@@ -132,6 +133,313 @@ extern const short *BIONIC_toupper_tab_;
 static FILE __sF_fake[3];
 
 void *dlsym_soloader(void * handle, const char * symbol);
+
+// Bionic float classification helpers (not exported by newlib under these names)
+static int __isfinite_soloader(double x) { return isfinite(x); }
+static int __isfinitef_soloader(float x) { return isfinite(x); }
+static int __isinf_soloader(double x) { return isinf(x); }
+static int __isinff_soloader(float x) { return isinf(x); }
+static int __isnan_soloader(double x) { return isnan(x); }
+static int __isnanf_soloader(float x) { return isnan(x); }
+
+// GLES1 features vitaGL doesn't implement. The game checks glGetError() after
+// texture setup and throws the texture away on any error, so these must not
+// raise GL_INVALID_ENUM.
+#ifndef GL_GENERATE_MIPMAP
+#define GL_GENERATE_MIPMAP 0x8191
+#endif
+static int gles1_unsupported_cap(GLenum cap) {
+	switch (cap) {
+	case 0x0B10: // GL_POINT_SMOOTH
+	case 0x0B20: // GL_LINE_SMOOTH
+	case 0x0BD0: // GL_DITHER
+	case 0x0BA1: // GL_NORMALIZE
+	case 0x803A: // GL_RESCALE_NORMAL
+	case 0x809D: // GL_MULTISAMPLE
+		return 1;
+	}
+	return 0;
+}
+// Vita3K workaround: a color-only glClear after the splash makes Vita3K's
+// sceGxmReserve*DefaultUniformBuffer return NULL and the emulator crashes at
+// the next swap. The game redraws the whole screen every frame, so skipping
+// color-only clears is invisible. Real hardware: build with -DVITA3K_WORKAROUNDS=OFF.
+static void glClear_shim(GLbitfield mask) {
+#ifdef VITA3K_NO_COLOR_CLEAR
+	if (mask == GL_COLOR_BUFFER_BIT)
+		return;
+#endif
+	glClear(mask);
+}
+static void glEnable_shim(GLenum cap) { if (!gles1_unsupported_cap(cap)) glEnable(cap); }
+static void glDisable_shim(GLenum cap) { if (!gles1_unsupported_cap(cap)) glDisable(cap); }
+static void glHint_shim(GLenum target, GLenum mode) {
+	if (target >= 0x0C50 && target <= 0x0C54) return; // GLES1 *_SMOOTH_HINT / PERSPECTIVE / FOG
+	if (target == 0x8192) return; // GL_GENERATE_MIPMAP_HINT
+	glHint(target, mode);
+}
+// GLES1 GL_GENERATE_MIPMAP: vitaGL rejects it, but the game still selects
+// mipmapped min filters (e.g. GL_LINEAR_MIPMAP_LINEAR) on those textures, and
+// sampling missing mip levels crashes Vita3K. Remember the flag per texture
+// and build the mip chain with glGenerateMipmap after each upload.
+#define AUTOMIP_MAX 8192
+static uint8_t automip[AUTOMIP_MAX];
+static GLuint bound_tex2d[8];
+static int active_unit = 0;
+
+static void set_automip(GLenum target, int on) {
+	GLuint t = bound_tex2d[active_unit];
+	if (target == GL_TEXTURE_2D && t < AUTOMIP_MAX)
+		automip[t] = on ? 1 : 0;
+}
+static void glBindTexture_shim(GLenum target, GLuint tex) {
+	if (target == GL_TEXTURE_2D)
+		bound_tex2d[active_unit] = tex;
+	glBindTexture(target, tex);
+}
+static void glActiveTexture_shim(GLenum unit) {
+	int u = (int)unit - GL_TEXTURE0;
+	if (u >= 0 && u < 8)
+		active_unit = u;
+	glActiveTexture(unit);
+}
+static void glGenTextures_shim(GLsizei n, GLuint *tex) {
+	glGenTextures(n, tex);
+	for (GLsizei i = 0; i < n; i++)
+		if (tex[i] < AUTOMIP_MAX)
+			automip[tex[i]] = 0;
+}
+static void glTexImage2D_shim(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
+                              GLint border, GLenum fmt, GLenum type, const void *data) {
+	glTexImage2D(target, level, ifmt, w, h, border, fmt, type, data);
+	GLuint t = bound_tex2d[active_unit];
+	if (target == GL_TEXTURE_2D && level == 0 && t < AUTOMIP_MAX && automip[t])
+		glGenerateMipmap(GL_TEXTURE_2D);
+}
+static void glTexSubImage2D_shim(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                                 GLenum fmt, GLenum type, const void *data) {
+	glTexSubImage2D(target, level, x, y, w, h, fmt, type, data);
+	GLuint t = bound_tex2d[active_unit];
+	if (target == GL_TEXTURE_2D && level == 0 && t < AUTOMIP_MAX && automip[t])
+		glGenerateMipmap(GL_TEXTURE_2D);
+}
+static void glTexParameterf_shim(GLenum target, GLenum pname, GLfloat param) {
+	if (pname == GL_GENERATE_MIPMAP) { set_automip(target, param != 0.0f); return; }
+	glTexParameterf(target, pname, param);
+}
+static void glTexParameteri_shim(GLenum target, GLenum pname, GLint param) {
+	if (pname == GL_GENERATE_MIPMAP) { set_automip(target, param != 0); return; }
+	glTexParameteri(target, pname, param);
+}
+static void glTexParameteriv_shim(GLenum target, GLenum pname, const GLint *params) {
+	if (pname == GL_GENERATE_MIPMAP) { set_automip(target, params && params[0] != 0); return; }
+	glTexParameteriv(target, pname, params);
+}
+
+#ifdef DEBUG_SOLOADER
+static int glt_verbose;      // defined with the GL trace helpers below
+static int glt_verbose_left;
+#endif
+
+// Diagnostic: never hand deleted textures back to vitaGL (no GPU memory reuse).
+// Testing whether reused texture memory overlaps GXM's ring buffers.
+#define TEX_NEVER_FREE 0
+
+// Deferred texture deletion: the game deletes textures that were drawn in the
+// frame still in flight. Hold deletions for a few swaps before handing them to
+// vitaGL so the GPU (and Vita3K) never sees a freed texture.
+#define TEX_DEFER_FRAMES 3
+#define TEX_DEFER_MAX 1024
+static GLuint tex_defer[TEX_DEFER_FRAMES][TEX_DEFER_MAX];
+static int tex_defer_n[TEX_DEFER_FRAMES];
+static int tex_defer_cur = 0;
+
+static void glDeleteTextures_deferred(GLsizei n, const GLuint *textures) {
+	for (GLsizei i = 0; i < n; i++) {
+		if (!textures[i])
+			continue;
+		int *cnt = &tex_defer_n[tex_defer_cur];
+		if (*cnt == TEX_DEFER_MAX) { // bucket full: delete right away
+#if !TEX_NEVER_FREE
+			glDeleteTextures(1, &textures[i]);
+#endif
+			continue;
+		}
+		tex_defer[tex_defer_cur][(*cnt)++] = textures[i];
+	}
+}
+
+static EGLBoolean eglSwapBuffers_deferred(EGLDisplay display, EGLSurface surface) {
+#ifdef DEBUG_SOLOADER
+	if (glt_verbose && glt_verbose_left > 0) { glt_verbose_left--; sceClibPrintf("[gltrace] eglSwapBuffers()\n"); }
+#endif
+	EGLBoolean ret = eglSwapBuffers(display, surface);
+#ifdef HEAP_WATCH
+	{
+		extern void heapwatch_check(unsigned frame);
+		static unsigned frame = 0;
+		heapwatch_check(++frame);
+	}
+#endif
+	// Free the oldest bucket, then make it the current one
+	tex_defer_cur = (tex_defer_cur + 1) % TEX_DEFER_FRAMES;
+	if (tex_defer_n[tex_defer_cur]) {
+#if !TEX_NEVER_FREE
+		glDeleteTextures(tex_defer_n[tex_defer_cur], tex_defer[tex_defer_cur]);
+#endif
+		tex_defer_n[tex_defer_cur] = 0;
+	}
+	return ret;
+}
+
+#ifdef DEBUG_SOLOADER
+// Trace wrappers for framebuffer/texture calls (debug builds only)
+#define GLT(fmt, ...) sceClibPrintf("[gltrace] " fmt "\n", ##__VA_ARGS__)
+static void t_glBindFramebuffer(GLenum t, GLuint fb) { GLT("glBindFramebuffer(0x%x, %u)", t, fb); glBindFramebuffer(t, fb); }
+static void t_glBindRenderbuffer(GLenum t, GLuint rb) { GLT("glBindRenderbuffer(0x%x, %u)", t, rb); glBindRenderbuffer(t, rb); }
+static GLenum t_glCheckFramebufferStatus(GLenum t) { GLenum r = glCheckFramebufferStatus(t); GLT("glCheckFramebufferStatus(0x%x) = 0x%x", t, r); return r; }
+static void t_glDeleteFramebuffers(GLsizei n, const GLuint *f) { GLT("glDeleteFramebuffers(%d, first=%u)", n, n > 0 ? f[0] : 0); glDeleteFramebuffers(n, f); }
+static void t_glDeleteTextures(GLsizei n, const GLuint *t) { glt_verbose = 1; GLT("glDeleteTextures(%d, first=%u) [deferred]", n, n > 0 ? t[0] : 0); glDeleteTextures_deferred(n, t); }
+static void t_glFramebufferRenderbuffer(GLenum t, GLenum a, GLenum rt, GLuint rb) { GLT("glFramebufferRenderbuffer(0x%x, 0x%x, 0x%x, %u)", t, a, rt, rb); glFramebufferRenderbuffer(t, a, rt, rb); }
+static void t_glFramebufferTexture2D(GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l) { GLT("glFramebufferTexture2D(0x%x, 0x%x, 0x%x, %u, %d)", t, a, tt, tex, l); glFramebufferTexture2D(t, a, tt, tex, l); }
+static void t_glGenFramebuffers(GLsizei n, GLuint *f) { glGenFramebuffers(n, f); GLT("glGenFramebuffers(%d) -> %u", n, n > 0 ? f[0] : 0); }
+static void t_glGenRenderbuffers(GLsizei n, GLuint *r) { glGenRenderbuffers(n, r); GLT("glGenRenderbuffers(%d) -> %u", n, n > 0 ? r[0] : 0); }
+static void t_glRenderbufferStorage(GLenum t, GLenum f, GLsizei w, GLsizei h) { GLT("glRenderbufferStorage(0x%x, 0x%x, %d, %d)", t, f, w, h); glRenderbufferStorage(t, f, w, h); }
+static void t_glTexImage2D(GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *d) { GLT("glTexImage2D(0x%x, %d, 0x%x, %d, %d, fmt=0x%x, type=0x%x, data=%p)%s", t, l, i, w, h, f, ty, d, (bound_tex2d[active_unit] < AUTOMIP_MAX && automip[bound_tex2d[active_unit]]) ? " +mipmaps" : ""); glTexImage2D_shim(t, l, i, w, h, b, f, ty, d); }
+static void t_glViewport(GLint x, GLint y, GLsizei w, GLsizei h) { GLT("glViewport(%d, %d, %d, %d)", x, y, w, h); glViewport(x, y, w, h); }
+
+// Once the game first deletes a texture (a few ms before the Vita3K crash,
+// right after the splash), log every call instead of only new combinations.
+static int glt_verbose = 0;
+static int glt_verbose_left = 3000;
+// Log each distinct (call, args) combination only once
+static int glt_seen(uint32_t a, uint32_t b, uint32_t c) {
+	if (glt_verbose && glt_verbose_left > 0) { glt_verbose_left--; return 0; }
+	static uint32_t seen[4096][3];
+	static int n = 0;
+	for (int i = 0; i < n; i++)
+		if (seen[i][0] == a && seen[i][1] == b && seen[i][2] == c) return 1;
+	if (n < 4096) { seen[n][0] = a; seen[n][1] = b; seen[n][2] = c; n++; }
+	return 0;
+}
+#define GLT1(id, a, b, fmt, ...) do { if (!glt_seen(id, (uint32_t)(a), (uint32_t)(b))) GLT(fmt, ##__VA_ARGS__); } while (0)
+static uint32_t f2u(float f) { union { float f; uint32_t u; } x = { f }; return x.u; }
+
+// Client state tracking so each draw logs its full vertex setup
+static uint32_t glt_cs_mask; // bit0 vertex, bit1 normal, bit2 color, bit3 texcoord
+static uint32_t glt_ptr_fmt[4]; // (size << 16) | type
+static GLuint glt_bound_buffer;
+static int glt_tex2d;
+static int glt_cs_bit(GLenum a) { return a == 0x8074 ? 0 : a == 0x8075 ? 1 : a == 0x8076 ? 2 : a == 0x8078 ? 3 : -1; }
+static void t_glVertexPointer(GLint sz, GLenum ty, GLsizei st, const void *p) { glt_ptr_fmt[0] = (sz << 16) | ty; GLT1(20, glt_ptr_fmt[0], st, "glVertexPointer(size=%d, type=0x%x, stride=%d) vbo=%u", sz, ty, st, glt_bound_buffer); glVertexPointer(sz, ty, st, p); }
+static void t_glColorPointer(GLint sz, GLenum ty, GLsizei st, const void *p) { glt_ptr_fmt[2] = (sz << 16) | ty; GLT1(21, glt_ptr_fmt[2], st, "glColorPointer(size=%d, type=0x%x, stride=%d) vbo=%u", sz, ty, st, glt_bound_buffer); glColorPointer(sz, ty, st, p); }
+static void t_glTexCoordPointer(GLint sz, GLenum ty, GLsizei st, const void *p) { glt_ptr_fmt[3] = (sz << 16) | ty; GLT1(22, glt_ptr_fmt[3], st, "glTexCoordPointer(size=%d, type=0x%x, stride=%d) vbo=%u", sz, ty, st, glt_bound_buffer); glTexCoordPointer(sz, ty, st, p); }
+static void t_glBindBuffer(GLenum t, GLuint b) { if (t == 0x8892) glt_bound_buffer = b; GLT1(23, t, b ? 1 : 0, "glBindBuffer(0x%x, %s)", t, b ? "nonzero" : "0"); glBindBuffer(t, b); }
+static void t_glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { GLT1(24, 0, 0, "glColor4f(...) first use"); glColor4f(r, g, b, a); }
+static void glt_draw(const char *fn, GLenum m, GLsizei c, GLenum it) {
+	uint32_t key = (m << 24) ^ (glt_cs_mask << 16) ^ (glt_tex2d << 15) ^ (it & 0x7fff);
+	uint32_t fmt = glt_ptr_fmt[0] ^ (glt_ptr_fmt[2] << 3) ^ (glt_ptr_fmt[3] << 7);
+	if (!glt_seen(30, key, fmt))
+		GLT("%s(mode=0x%x, count=%d, idxtype=0x%x) arrays=[%s%s%s%s] tex2d=%d vtx=%d/0x%x col=%d/0x%x tc=%d/0x%x vbo=%u",
+			fn, m, c, it,
+			(glt_cs_mask & 1) ? "V" : "", (glt_cs_mask & 2) ? "N" : "", (glt_cs_mask & 4) ? "C" : "", (glt_cs_mask & 8) ? "T" : "",
+			glt_tex2d, glt_ptr_fmt[0] >> 16, glt_ptr_fmt[0] & 0xffff, glt_ptr_fmt[2] >> 16, glt_ptr_fmt[2] & 0xffff,
+			glt_ptr_fmt[3] >> 16, glt_ptr_fmt[3] & 0xffff, glt_bound_buffer);
+}
+static void t_glEnable(GLenum c) { if (c == 0xde1) glt_tex2d = 1; GLT1(1, c, 0, "glEnable(0x%x)%s", c, gles1_unsupported_cap(c) ? " [ignored]" : ""); glEnable_shim(c); }
+static void t_glDisable(GLenum c) { if (c == 0xde1) glt_tex2d = 0; GLT1(2, c, 0, "glDisable(0x%x)", c); glDisable_shim(c); }
+static void t_glTexEnvf(GLenum t, GLenum p, GLfloat v) { GLT1(3, p, f2u(v), "glTexEnvf(0x%x, 0x%x, %f)", t, p, v); glTexEnvf(t, p, v); }
+static void t_glTexEnvi(GLenum t, GLenum p, GLint v) { GLT1(4, p, v, "glTexEnvi(0x%x, 0x%x, 0x%x)", t, p, v); glTexEnvi(t, p, v); }
+static void t_glTexEnvfv(GLenum t, GLenum p, const GLfloat *v) { GLT1(5, p, 0, "glTexEnvfv(0x%x, 0x%x, {%f,%f,%f,%f})", t, p, v[0], v[1], v[2], v[3]); glTexEnvfv(t, p, v); }
+static void t_glDrawArrays(GLenum m, GLint f, GLsizei c) { glt_draw("glDrawArrays", m, c, 0); glDrawArrays(m, f, c); }
+static void t_glDrawElements(GLenum m, GLsizei c, GLenum t, const void *i) { glt_draw("glDrawElements", m, c, t); glDrawElements(m, c, t, i); }
+static void t_glPointSize(GLfloat v) { GLT1(8, f2u(v), 0, "glPointSize(%f)", v); glPointSize(v); }
+static void t_glLineWidth(GLfloat v) { GLT1(9, f2u(v), 0, "glLineWidth(%f)", v); glLineWidth(v); }
+static void t_glEnableClientState(GLenum a) { int b = glt_cs_bit(a); if (b >= 0) glt_cs_mask |= 1u << b; GLT1(10, a, 0, "glEnableClientState(0x%x)", a); glEnableClientState(a); }
+static void t_glDisableClientState(GLenum a) { int b = glt_cs_bit(a); if (b >= 0) glt_cs_mask &= ~(1u << b); GLT1(11, a, 0, "glDisableClientState(0x%x)", a); glDisableClientState(a); }
+static void t_glActiveTexture(GLenum t) { GLT1(12, t, 0, "glActiveTexture(0x%x)", t); glActiveTexture_shim(t); }
+static void t_glClientActiveTexture(GLenum t) { GLT1(13, t, 0, "glClientActiveTexture(0x%x)", t); glClientActiveTexture(t); }
+static void t_glBlendFunc(GLenum a, GLenum b) { GLT1(14, a, b, "glBlendFunc(0x%x, 0x%x)", a, b); glBlendFunc(a, b); }
+
+static void t_glBindTexture(GLenum t, GLuint tex) { GLT1(40, t, tex, "glBindTexture(0x%x, %u)", t, tex); glBindTexture_shim(t, tex); }
+static void t_glScissor(GLint x, GLint y, GLsizei w, GLsizei h) { GLT1(41, (x << 16) ^ y, (w << 16) ^ h, "glScissor(%d, %d, %d, %d)", x, y, w, h); glScissor(x, y, w, h); }
+static void t_glClear(GLbitfield m) { GLT1(42, m, 0, "glClear(0x%x)", m); glClear_shim(m); }
+static void t_glDepthMask(GLboolean f) { GLT1(43, f, 0, "glDepthMask(%d)", f); glDepthMask(f); }
+static void t_glDepthFunc(GLenum f) { GLT1(44, f, 0, "glDepthFunc(0x%x)", f); glDepthFunc(f); }
+static void t_glMatrixMode(GLenum m) { GLT1(45, m, 0, "glMatrixMode(0x%x)", m); glMatrixMode(m); }
+static void t_glLoadIdentity(void) { GLT1(46, 0, 0, "glLoadIdentity()"); glLoadIdentity(); }
+static void t_glLoadMatrixf(const GLfloat *m) { GLT1(47, 0, 0, "glLoadMatrixf(%f %f %f %f | %f %f %f %f)", m[0], m[5], m[10], m[15], m[12], m[13], m[14], m[3]); glLoadMatrixf(m); }
+static void t_glMultMatrixf(const GLfloat *m) { GLT1(48, 0, 0, "glMultMatrixf(%f %f %f %f | %f %f %f %f)", m[0], m[5], m[10], m[15], m[12], m[13], m[14], m[3]); glMultMatrixf(m); }
+static void t_glGenTextures(GLsizei n, GLuint *t) { glGenTextures_shim(n, t); GLT1(49, 0, 0, "glGenTextures(%d) -> %u", n, n > 0 ? t[0] : 0); }
+static void t_glTexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty, const void *d) { GLT1(50, (w << 16) ^ h, f, "glTexSubImage2D(%d,%d %dx%d fmt=0x%x type=0x%x)", x, y, w, h, f, ty); glTexSubImage2D_shim(t, l, x, y, w, h, f, ty, d); }
+static void t_glFrontFace(GLenum m) { GLT1(51, m, 0, "glFrontFace(0x%x)", m); glFrontFace(m); }
+#define GLWRAP(fn) t_##fn
+#else
+#define GLWRAP(fn) fn
+#endif
+
+#ifdef HEAP_WATCH
+void *hw_malloc(size_t); void *hw_calloc(size_t, size_t); void *hw_realloc(void *, size_t);
+void *hw_memalign(size_t, size_t);
+#endif
+#ifdef USE_SCELIBC_IO
+// Trace I/O on .ui files (UI systems come up with 0 widgets): which FILE*s
+// belong to .ui files is recorded by fopen_soloader().
+extern void *ui_trace_files[8];
+void game_log_file(const char *tag, const char *text);
+// .ui read tracing found the rewind() bug; keep it off so game_log.txt stays readable
+#define UI_IO_TRACE 0
+static int ui_traced(void *f) {
+#if UI_IO_TRACE
+	for (int i = 0; i < 8; i++) if (f && ui_trace_files[i] == f) return 1;
+#endif
+	(void)f;
+	return 0;
+}
+static size_t trace_fread(void *buf, size_t sz, size_t n, FILE *f) {
+	size_t r = sceLibcBridge_fread(buf, sz, n, f);
+	if (ui_traced(f)) {
+		char m[160];
+		snprintf(m, sizeof(m), "fread(%p, %u, %u, %p) = %u", buf, (unsigned)sz, (unsigned)n, f, (unsigned)r);
+		game_log_file("uiio", m);
+	}
+	return r;
+}
+static int trace_fseek(FILE *f, long off, int whence) {
+	int r = sceLibcBridge_fseek(f, off, whence);
+	if (ui_traced(f)) {
+		char m[160];
+		snprintf(m, sizeof(m), "fseek(%p, %ld, %d) = %d", f, off, whence, r);
+		game_log_file("uiio", m);
+	}
+	return r;
+}
+static long trace_ftell(FILE *f) {
+	long r = sceLibcBridge_ftell(f);
+	if (ui_traced(f)) {
+		char m[160];
+		snprintf(m, sizeof(m), "ftell(%p) = %ld", f, r);
+		game_log_file("uiio", m);
+	}
+	return r;
+}
+#endif
+
+#ifdef USE_SCELIBC_IO
+static void rewind_soloader(FILE *f) {
+	// rewind() == fseek(f, 0, SEEK_SET) plus clearing the error indicator
+	sceLibcBridge_fseek(f, 0, SEEK_SET);
+}
+#endif
+
+// The window covers the whole screen, so raw (screen) == window coordinates
+static float AMotionEvent_getRawX_soloader(const AInputEvent *e, size_t i) { return AMotionEvent_getX(e, i); }
+static float AMotionEvent_getRawY_soloader(const AInputEvent *e, size_t i) { return AMotionEvent_getY(e, i); }
+// Android event times are in nanoseconds (SYSTEM_TIME_MONOTONIC)
+static int64_t AKeyEvent_getEventTime_soloader(const AInputEvent *e) {
+	(void)e;
+	return (int64_t)sceKernelGetProcessTimeWide() * 1000;
+}
 
 so_default_dynlib default_dynlib[] = {
         // Common C/C++ internals
@@ -208,7 +516,12 @@ so_default_dynlib default_dynlib[] = {
         { "__google_potentially_blocking_region_begin", (uintptr_t)&ret0 },
         { "__google_potentially_blocking_region_end", (uintptr_t)&ret0 },
         { "__gxx_personality_v0", (uintptr_t)&__gxx_personality_v0 },
-        { "__isinf", (uintptr_t)&ret0 },
+        { "__isfinite", (uintptr_t)&__isfinite_soloader },
+        { "__isfinitef", (uintptr_t)&__isfinitef_soloader },
+        { "__isinf", (uintptr_t)&__isinf_soloader },
+        { "__isinff", (uintptr_t)&__isinff_soloader },
+        { "__isnan", (uintptr_t)&__isnan_soloader },
+        { "__isnanf", (uintptr_t)&__isnanf_soloader },
         { "__page_size", (uintptr_t)&__page_size },
         { "__sF", (uintptr_t)&__sF_fake },
         { "__srget", (uintptr_t)&__srget },
@@ -285,6 +598,16 @@ so_default_dynlib default_dynlib[] = {
         {"AMotionEvent_getAxisValue", (uintptr_t)&AMotionEvent_getAxisValue},
         {"AMotionEvent_getPointerCount", (uintptr_t)&AMotionEvent_getPointerCount},
         {"AMotionEvent_getX", (uintptr_t)&AMotionEvent_getX},
+        // Imports the game uses that were unresolved (touch at the Start screen
+        // crashed in reloc_err via AMotionEvent_getRawX)
+        {"AMotionEvent_getRawX", (uintptr_t)&AMotionEvent_getRawX_soloader},
+        {"AMotionEvent_getRawY", (uintptr_t)&AMotionEvent_getRawY_soloader},
+        {"AMotionEvent_getPointerId", (uintptr_t)&AMotionEvent_getPointerId},
+        {"AKeyEvent_getRepeatCount", (uintptr_t)&AKeyEvent_getRepeatCount},
+        {"AKeyEvent_getEventTime", (uintptr_t)&AKeyEvent_getEventTime_soloader},
+        {"ASensorEventQueue_enableSensor", (uintptr_t)&ASensorEventQueue_enableSensor},
+        {"ASensorEventQueue_disableSensor", (uintptr_t)&ASensorEventQueue_disableSensor},
+        {"ASensorEventQueue_setEventRate", (uintptr_t)&ASensorEventQueue_setEventRate},
         {"AMotionEvent_getY", (uintptr_t)&AMotionEvent_getY},
         {"ANativeActivity_finish", (uintptr_t)&ANativeActivity_finish},
         {"ANativeActivity_setWindowFlags", (uintptr_t)&ANativeActivity_setWindowFlags},
@@ -390,10 +713,22 @@ so_default_dynlib default_dynlib[] = {
 
 
         // Memory
+#ifdef HEAP_WATCH
+        { "calloc", (uintptr_t)&hw_calloc },
+#else
         { "calloc", (uintptr_t)&calloc },
+#endif
         { "free", (uintptr_t)&free },
+#ifdef HEAP_WATCH
+        { "malloc", (uintptr_t)&hw_malloc },
+#else
         { "malloc", (uintptr_t)&malloc },
+#endif
+#ifdef HEAP_WATCH
+        { "memalign", (uintptr_t)&hw_memalign },
+#else
         { "memalign", (uintptr_t)&memalign },
+#endif
         { "memcmp", (uintptr_t)&memcmp },
         { "memcpy", (uintptr_t)&sceClibMemcpy },
         { "memmem", (uintptr_t)&memmem },
@@ -402,7 +737,11 @@ so_default_dynlib default_dynlib[] = {
         { "mmap", (uintptr_t)&mmap },
         { "__mmap2", (uintptr_t)&mmap },
         { "munmap", (uintptr_t)&munmap },
+#ifdef HEAP_WATCH
+        { "realloc", (uintptr_t)&hw_realloc },
+#else
         { "realloc", (uintptr_t)&realloc },
+#endif
         { "valloc", (uintptr_t)&valloc },
 
 
@@ -439,11 +778,11 @@ so_default_dynlib default_dynlib[] = {
             { "fileno", (uintptr_t)&sceLibcBridge_fileno },
             { "fputc", (uintptr_t)&sceLibcBridge_fputc },
             { "fputs", (uintptr_t)&sceLibcBridge_fputs },
-            { "fread", (uintptr_t)&sceLibcBridge_fread },
+            { "fread", (uintptr_t)&trace_fread },
             { "freopen", (uintptr_t)&sceLibcBridge_freopen },
-            { "fseek", (uintptr_t)&sceLibcBridge_fseek },
+            { "fseek", (uintptr_t)&trace_fseek },
             { "fsetpos", (uintptr_t)&sceLibcBridge_fsetpos },
-            { "ftell", (uintptr_t)&sceLibcBridge_ftell },
+            { "ftell", (uintptr_t)&trace_ftell },
             { "fwide", (uintptr_t)&sceLibcBridge_fwide },
             { "fwrite", (uintptr_t)&sceLibcBridge_fwrite },
             { "getc", (uintptr_t)&sceLibcBridge_getc },
@@ -507,7 +846,14 @@ so_default_dynlib default_dynlib[] = {
         { "realpath", (uintptr_t)&realpath },
         { "remove", (uintptr_t)&remove },
         { "rename", (uintptr_t)&rename },
+#ifdef USE_SCELIBC_IO
+        // FILE*s come from sceLibcBridge_fopen: newlib's rewind() doesn't
+        // understand them (the game's fseek-END/ftell/rewind/fread size probe
+        // read 0 bytes, so every .ui file loaded as an empty UI system).
+        { "rewind", (uintptr_t)&rewind_soloader },
+#else
         { "rewind", (uintptr_t)&rewind },
+#endif
         { "rmdir", (uintptr_t)&rmdir },
         { "truncate", (uintptr_t)&truncate },
         { "unlink", (uintptr_t)&unlink },
@@ -561,48 +907,60 @@ so_default_dynlib default_dynlib[] = {
         { "eglQueryContext", (uintptr_t)&eglQueryContext },
         { "eglQueryString", (uintptr_t)&eglQueryString },
         { "eglQuerySurface", (uintptr_t)&eglQuerySurface },
-        { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers },
+        { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers_deferred },
         { "eglTerminate", (uintptr_t)&eglTerminate },
 
 
         // OpenGL
-        { "glActiveTexture", (uintptr_t)&glActiveTexture },
+        #ifdef DEBUG_SOLOADER
+        { "glActiveTexture", (uintptr_t)&t_glActiveTexture },
+#else
+        { "glActiveTexture", (uintptr_t)&glActiveTexture_shim },
+#endif
         { "glAlphaFunc", (uintptr_t)&glAlphaFunc },
         { "glAlphaFuncx", (uintptr_t)&glAlphaFuncx },
         { "glAttachShader", (uintptr_t)&glAttachShader },
         { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
-        { "glBindBuffer", (uintptr_t)&glBindBuffer },
+        { "glBindBuffer", (uintptr_t)&GLWRAP(glBindBuffer) },
         { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
-        { "glBindFramebufferOES", (uintptr_t)&glBindFramebuffer },
+        { "glBindFramebufferOES", (uintptr_t)&GLWRAP(glBindFramebuffer) },
         { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
-        { "glBindRenderbufferOES", (uintptr_t)&glBindRenderbuffer },
-        { "glBindTexture", (uintptr_t)&glBindTexture },
+        { "glBindRenderbufferOES", (uintptr_t)&GLWRAP(glBindRenderbuffer) },
+        #ifdef DEBUG_SOLOADER
+        { "glBindTexture", (uintptr_t)&t_glBindTexture },
+#else
+        { "glBindTexture", (uintptr_t)&glBindTexture_shim },
+#endif
         { "glBlendColor", (uintptr_t)&ret0 },
         { "glBlendEquation", (uintptr_t)&glBlendEquation },
         { "glBlendEquationOES", (uintptr_t)&glBlendEquation },
         { "glBlendEquationSeparate", (uintptr_t)&glBlendEquationSeparate },
         { "glBlendEquationSeparateOES", (uintptr_t)&glBlendEquationSeparate },
-        { "glBlendFunc", (uintptr_t)&glBlendFunc },
+        { "glBlendFunc", (uintptr_t)&GLWRAP(glBlendFunc) },
         { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate },
         { "glBlendFuncSeparateOES", (uintptr_t)&glBlendFuncSeparate },
         { "glBufferData", (uintptr_t)&glBufferData },
         { "glBufferSubData", (uintptr_t)&glBufferSubData },
         { "glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus },
-        { "glCheckFramebufferStatusOES", (uintptr_t)&glCheckFramebufferStatus },
-        { "glClear", (uintptr_t)&glClear },
+        { "glCheckFramebufferStatusOES", (uintptr_t)&GLWRAP(glCheckFramebufferStatus) },
+        #ifdef DEBUG_SOLOADER
+        { "glClear", (uintptr_t)&t_glClear },
+#else
+        { "glClear", (uintptr_t)&glClear_shim },
+#endif
         { "glClearColor", (uintptr_t)&glClearColor },
         { "glClearColorx", (uintptr_t)&glClearColorx },
         { "glClearDepthf", (uintptr_t)&glClearDepthf },
         { "glClearDepthx", (uintptr_t)&glClearDepthx },
         { "glClearStencil", (uintptr_t)&glClearStencil },
-        { "glClientActiveTexture", (uintptr_t)&glClientActiveTexture },
+        { "glClientActiveTexture", (uintptr_t)&GLWRAP(glClientActiveTexture) },
         { "glClipPlanef", (uintptr_t)&glClipPlanef },
         { "glClipPlanex", (uintptr_t)&glClipPlanex },
-        { "glColor4f", (uintptr_t)&glColor4f },
+        { "glColor4f", (uintptr_t)&GLWRAP(glColor4f) },
         { "glColor4ub", (uintptr_t)&glColor4ub },
         { "glColor4x", (uintptr_t)&glColor4x },
         { "glColorMask", (uintptr_t)&glColorMask },
-        { "glColorPointer", (uintptr_t)&glColorPointer },
+        { "glColorPointer", (uintptr_t)&GLWRAP(glColorPointer) },
         { "glCompileShader", (uintptr_t)&glCompileShader_soloader },
         { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
         { "glCompressedTexSubImage2D", (uintptr_t)&ret0 },
@@ -614,22 +972,30 @@ so_default_dynlib default_dynlib[] = {
         { "glCurrentPaletteMatrixOES", (uintptr_t)&ret0 },
         { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
         { "glDeleteFramebuffers", (uintptr_t)&glDeleteFramebuffers },
-        { "glDeleteFramebuffersOES", (uintptr_t)&glDeleteFramebuffers },
+        { "glDeleteFramebuffersOES", (uintptr_t)&GLWRAP(glDeleteFramebuffers) },
         { "glDeleteProgram", (uintptr_t)&glDeleteProgram },
         { "glDeleteRenderbuffers", (uintptr_t)&glDeleteRenderbuffers },
         { "glDeleteRenderbuffersOES", (uintptr_t)&glDeleteRenderbuffers },
         { "glDeleteShader", (uintptr_t)&glDeleteShader },
-        { "glDeleteTextures", (uintptr_t)&glDeleteTextures },
-        { "glDepthFunc", (uintptr_t)&glDepthFunc },
-        { "glDepthMask", (uintptr_t)&glDepthMask },
+        #ifdef DEBUG_SOLOADER
+        { "glDeleteTextures", (uintptr_t)&t_glDeleteTextures },
+#else
+        { "glDeleteTextures", (uintptr_t)&glDeleteTextures_deferred },
+#endif
+        { "glDepthFunc", (uintptr_t)&GLWRAP(glDepthFunc) },
+        { "glDepthMask", (uintptr_t)&GLWRAP(glDepthMask) },
         { "glDepthRangef", (uintptr_t)&glDepthRangef },
         { "glDepthRangex", (uintptr_t)&glDepthRangex },
         { "glDetachShader", (uintptr_t)&ret0 },
-        { "glDisable", (uintptr_t)&glDisable },
-        { "glDisableClientState", (uintptr_t)&glDisableClientState },
+        #ifdef DEBUG_SOLOADER
+        { "glDisable", (uintptr_t)&t_glDisable },
+#else
+        { "glDisable", (uintptr_t)&glDisable_shim },
+#endif
+        { "glDisableClientState", (uintptr_t)&GLWRAP(glDisableClientState) },
         { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-        { "glDrawArrays", (uintptr_t)&glDrawArrays },
-        { "glDrawElements", (uintptr_t)&glDrawElements },
+        { "glDrawArrays", (uintptr_t)&GLWRAP(glDrawArrays) },
+        { "glDrawElements", (uintptr_t)&GLWRAP(glDrawElements) },
         { "glDrawTexfOES", (uintptr_t)&ret0 },
         { "glDrawTexfvOES", (uintptr_t)&ret0 },
         { "glDrawTexiOES", (uintptr_t)&ret0 },
@@ -640,8 +1006,12 @@ so_default_dynlib default_dynlib[] = {
         { "glDrawTexxvOES", (uintptr_t)&ret0 },
         { "glEGLImageTargetRenderbufferStorageOES", (uintptr_t)&ret0 },
         { "glEGLImageTargetTexture2DOES", (uintptr_t)&ret0 },
-        { "glEnable", (uintptr_t)&glEnable },
-        { "glEnableClientState", (uintptr_t)&glEnableClientState },
+        #ifdef DEBUG_SOLOADER
+        { "glEnable", (uintptr_t)&t_glEnable },
+#else
+        { "glEnable", (uintptr_t)&glEnable_shim },
+#endif
+        { "glEnableClientState", (uintptr_t)&GLWRAP(glEnableClientState) },
         { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
         { "glFinish", (uintptr_t)&glFinish },
         { "glFlush", (uintptr_t)&glFlush },
@@ -650,20 +1020,24 @@ so_default_dynlib default_dynlib[] = {
         { "glFogx", (uintptr_t)&glFogx },
         { "glFogxv", (uintptr_t)&glFogxv },
         { "glFramebufferRenderbuffer", (uintptr_t)&glFramebufferRenderbuffer },
-        { "glFramebufferRenderbufferOES", (uintptr_t)&glFramebufferRenderbuffer },
+        { "glFramebufferRenderbufferOES", (uintptr_t)&GLWRAP(glFramebufferRenderbuffer) },
         { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D },
-        { "glFramebufferTexture2DOES", (uintptr_t)&glFramebufferTexture2D },
-        { "glFrontFace", (uintptr_t)&glFrontFace },
+        { "glFramebufferTexture2DOES", (uintptr_t)&GLWRAP(glFramebufferTexture2D) },
+        { "glFrontFace", (uintptr_t)&GLWRAP(glFrontFace) },
         { "glFrustumf", (uintptr_t)&glFrustumf },
         { "glFrustumx", (uintptr_t)&glFrustumx },
         { "glGenBuffers", (uintptr_t)&glGenBuffers },
         { "glGenerateMipmap", (uintptr_t)&glGenerateMipmap },
         { "glGenerateMipmapOES", (uintptr_t)&glGenerateMipmap },
         { "glGenFramebuffers", (uintptr_t)&glGenFramebuffers },
-        { "glGenFramebuffersOES", (uintptr_t)&glGenFramebuffers },
+        { "glGenFramebuffersOES", (uintptr_t)&GLWRAP(glGenFramebuffers) },
         { "glGenRenderbuffers", (uintptr_t)&glGenRenderbuffers },
-        { "glGenRenderbuffersOES", (uintptr_t)&glGenRenderbuffers },
-        { "glGenTextures", (uintptr_t)&glGenTextures },
+        { "glGenRenderbuffersOES", (uintptr_t)&GLWRAP(glGenRenderbuffers) },
+        #ifdef DEBUG_SOLOADER
+        { "glGenTextures", (uintptr_t)&t_glGenTextures },
+#else
+        { "glGenTextures", (uintptr_t)&glGenTextures_shim },
+#endif
         { "glGetActiveAttrib", (uintptr_t)&glGetActiveAttrib },
         { "glGetActiveUniform", (uintptr_t)&glGetActiveUniform },
         { "glGetAttribLocation", (uintptr_t)&glGetAttribLocation },
@@ -699,7 +1073,7 @@ so_default_dynlib default_dynlib[] = {
         { "glGetTexParameteriv", (uintptr_t)&ret0 },
         { "glGetTexParameterxv", (uintptr_t)&ret0 },
         { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
-        { "glHint", (uintptr_t)&glHint },
+        { "glHint", (uintptr_t)&glHint_shim },
         { "glIsBuffer", (uintptr_t)&ret0 },
         { "glIsRenderbuffer", (uintptr_t)&glIsRenderbuffer },
         { "glIsEnabled", (uintptr_t)&glIsEnabled },
@@ -714,11 +1088,11 @@ so_default_dynlib default_dynlib[] = {
         { "glLightModelxv", (uintptr_t)&glLightModelxv },
         { "glLightx", (uintptr_t)&ret0 },
         { "glLightxv", (uintptr_t)&glLightxv },
-        { "glLineWidth", (uintptr_t)&glLineWidth },
+        { "glLineWidth", (uintptr_t)&GLWRAP(glLineWidth) },
         { "glLineWidthx", (uintptr_t)&glLineWidthx },
         { "glLinkProgram", (uintptr_t)&glLinkProgram },
-        { "glLoadIdentity", (uintptr_t)&glLoadIdentity },
-        { "glLoadMatrixf", (uintptr_t)&glLoadMatrixf },
+        { "glLoadIdentity", (uintptr_t)&GLWRAP(glLoadIdentity) },
+        { "glLoadMatrixf", (uintptr_t)&GLWRAP(glLoadMatrixf) },
         { "glLoadMatrixx", (uintptr_t)&glLoadMatrixx },
         { "glLoadPaletteFromModelViewMatrixOES", (uintptr_t)&ret0 },
         { "glLogicOp", (uintptr_t)&ret0 },
@@ -729,10 +1103,10 @@ so_default_dynlib default_dynlib[] = {
         { "glMaterialx", (uintptr_t)&glMaterialx },
         { "glMaterialxv", (uintptr_t)&glMaterialxv },
         { "glMatrixIndexPointerOES", (uintptr_t)&ret0 },
-        { "glMatrixMode", (uintptr_t)&glMatrixMode },
+        { "glMatrixMode", (uintptr_t)&GLWRAP(glMatrixMode) },
         { "glMultiTexCoord4f", (uintptr_t)&ret0 },
         { "glMultiTexCoord4x", (uintptr_t)&ret0},
-        { "glMultMatrixf", (uintptr_t)&glMultMatrixf },
+        { "glMultMatrixf", (uintptr_t)&GLWRAP(glMultMatrixf) },
         { "glMultMatrixx", (uintptr_t)&glMultMatrixx },
         { "glNormal3f", (uintptr_t)&glNormal3f },
         { "glNormal3x", (uintptr_t)&glNormal3x },
@@ -744,7 +1118,7 @@ so_default_dynlib default_dynlib[] = {
         { "glPointParameterfv", (uintptr_t)&ret0 },
         { "glPointParameterx", (uintptr_t)&ret0 },
         { "glPointParameterxv", (uintptr_t)&ret0 },
-        { "glPointSize", (uintptr_t)&glPointSize },
+        { "glPointSize", (uintptr_t)&GLWRAP(glPointSize) },
         { "glPointSizePointerOES", (uintptr_t)&ret0 },
         { "glPointSizex", (uintptr_t)&glPointSizex },
         { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
@@ -754,14 +1128,14 @@ so_default_dynlib default_dynlib[] = {
         { "glQueryMatrixxOES", (uintptr_t)&ret0 },
         { "glReadPixels", (uintptr_t)&glReadPixels },
         { "glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage },
-        { "glRenderbufferStorageOES", (uintptr_t)&glRenderbufferStorage },
+        { "glRenderbufferStorageOES", (uintptr_t)&GLWRAP(glRenderbufferStorage) },
         { "glRotatef", (uintptr_t)&glRotatef },
         { "glRotatex", (uintptr_t)&glRotatex },
         { "glSampleCoverage", (uintptr_t)&ret0 },
         { "glSampleCoveragex", (uintptr_t)&ret0 },
         { "glScalef", (uintptr_t)&glScalef },
         { "glScalex", (uintptr_t)&glScalex },
-        { "glScissor", (uintptr_t)&glScissor },
+        { "glScissor", (uintptr_t)&GLWRAP(glScissor) },
         { "glShadeModel", (uintptr_t)&glShadeModel },
         { "glShaderSource", (uintptr_t)&glShaderSource_soloader },
         { "glStencilFunc", (uintptr_t)&glStencilFunc },
@@ -769,10 +1143,10 @@ so_default_dynlib default_dynlib[] = {
         { "glStencilMask", (uintptr_t)&glStencilMask },
         { "glStencilOp", (uintptr_t)&glStencilOp },
         { "glStencilOpSeparate", (uintptr_t)&glStencilOpSeparate },
-        { "glTexCoordPointer", (uintptr_t)&glTexCoordPointer },
-        { "glTexEnvf", (uintptr_t)&glTexEnvf },
-        { "glTexEnvfv", (uintptr_t)&glTexEnvfv },
-        { "glTexEnvi", (uintptr_t)&glTexEnvi },
+        { "glTexCoordPointer", (uintptr_t)&GLWRAP(glTexCoordPointer) },
+        { "glTexEnvf", (uintptr_t)&GLWRAP(glTexEnvf) },
+        { "glTexEnvfv", (uintptr_t)&GLWRAP(glTexEnvfv) },
+        { "glTexEnvi", (uintptr_t)&GLWRAP(glTexEnvi) },
         { "glTexEnviv", (uintptr_t)&ret0 },
         { "glTexEnvx", (uintptr_t)&glTexEnvx },
         { "glTexEnvxv", (uintptr_t)&glTexEnvxv },
@@ -782,14 +1156,22 @@ so_default_dynlib default_dynlib[] = {
         { "glTexGenivOES", (uintptr_t)&ret0 },
         { "glTexGenxOES", (uintptr_t)&ret0 },
         { "glTexGenxvOES", (uintptr_t)&ret0 },
-        { "glTexImage2D", (uintptr_t)&glTexImage2D },
-        { "glTexParameterf", (uintptr_t)&glTexParameterf },
+        #ifdef DEBUG_SOLOADER
+        { "glTexImage2D", (uintptr_t)&t_glTexImage2D },
+#else
+        { "glTexImage2D", (uintptr_t)&glTexImage2D_shim },
+#endif
+        { "glTexParameterf", (uintptr_t)&glTexParameterf_shim },
         { "glTexParameterfv", (uintptr_t)&ret0 },
-        { "glTexParameteri", (uintptr_t)&glTexParameteri },
-        { "glTexParameteriv", (uintptr_t)&glTexParameteriv },
+        { "glTexParameteri", (uintptr_t)&glTexParameteri_shim },
+        { "glTexParameteriv", (uintptr_t)&glTexParameteriv_shim },
         { "glTexParameterx", (uintptr_t)&glTexParameterx },
         { "glTexParameterxv", (uintptr_t)&ret0 },
-        { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D },
+        #ifdef DEBUG_SOLOADER
+        { "glTexSubImage2D", (uintptr_t)&t_glTexSubImage2D },
+#else
+        { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D_shim },
+#endif
         { "glTranslatef", (uintptr_t)&glTranslatef },
         { "glTranslatex", (uintptr_t)&glTranslatex },
         { "glUniform1f", (uintptr_t)&glUniform1f },
@@ -818,8 +1200,8 @@ so_default_dynlib default_dynlib[] = {
         { "glVertexAttrib4f", (uintptr_t)&glVertexAttrib4f },
         { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
         { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
-        { "glVertexPointer", (uintptr_t)&glVertexPointer },
-        { "glViewport", (uintptr_t)&glViewport },
+        { "glVertexPointer", (uintptr_t)&GLWRAP(glVertexPointer) },
+        { "glViewport", (uintptr_t)&GLWRAP(glViewport) },
         { "glWeightPointerOES", (uintptr_t)&ret0 },
 
 
@@ -1120,5 +1502,11 @@ void resolve_imports(so_module* mod) {
     __sF_fake[1] = *stdout;
     __sF_fake[2] = *stderr;
 
+    extern void memfile_install(so_default_dynlib *tbl, int n);
+    memfile_install(default_dynlib, sizeof(default_dynlib) / sizeof(default_dynlib[0]));
+#ifdef PERF_LOG
+    extern void perf_install(so_default_dynlib *tbl, int n);
+    perf_install(default_dynlib, sizeof(default_dynlib) / sizeof(default_dynlib[0]));
+#endif
     so_resolve(mod, default_dynlib, sizeof(default_dynlib), 0);
 }

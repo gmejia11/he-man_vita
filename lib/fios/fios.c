@@ -8,6 +8,7 @@
  */
 
 #include <malloc.h>
+#include <string.h>
 
 #include "fios.h"
 
@@ -22,6 +23,16 @@ static int64_t g_DHStorage[SCE_FIOS_DH_STORAGE_SIZE(32, MAX_PATH_LENGTH) / sizeo
 
 static SceFiosRamCacheContext g_RamCacheContext = SCE_FIOS_RAM_CACHE_CONTEXT_INITIALIZER;
 static char *g_RamCacheWorkBuffer;
+
+// Guard area after the RAM cache work buffer. FIOS appears to write past
+// blocks*blockSize (He-Man: the heap block right after it was zeroed once
+// ~8 MB had been read, corrupting vitaGL/SceGxm objects). Keep slack behind
+// the buffer and expose it so the loader can check it.
+#define RAMCACHE_GUARD_SIZE (256 * 1024)
+#define RAMCACHE_GUARD_BYTE 0x5A
+char *fios_ramcache_buffer = NULL;
+unsigned fios_ramcache_size = 0;
+unsigned fios_ramcache_guard_size = RAMCACHE_GUARD_SIZE;
 
 int fios_init(const char * path) {
     int res;
@@ -49,9 +60,12 @@ int fios_init(const char * path) {
     if (res < 0)
         return res;
 
-    g_RamCacheWorkBuffer = memalign(8, RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE);
+    g_RamCacheWorkBuffer = memalign(8, RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE + RAMCACHE_GUARD_SIZE);
     if (!g_RamCacheWorkBuffer)
         return -1;
+    memset(g_RamCacheWorkBuffer + RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE, RAMCACHE_GUARD_BYTE, RAMCACHE_GUARD_SIZE);
+    fios_ramcache_buffer = g_RamCacheWorkBuffer;
+    fios_ramcache_size = RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE;
 
     g_RamCacheContext.pPath = path;
     g_RamCacheContext.pWorkBuffer = g_RamCacheWorkBuffer;

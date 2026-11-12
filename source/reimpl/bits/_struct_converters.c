@@ -79,6 +79,7 @@ dirent64_bionic * dirent_newlib_to_bionic(const struct dirent* dirent_newlib) {
  */
 SC_INLINE
 void stat_newlib_to_bionic(const struct stat * src, stat64_bionic * dst) {
+    memset(dst, 0, sizeof(*dst));
     dst->st_dev = src->st_dev;
     dst->__st_ino = src->st_ino;
     dst->st_ino = src->st_ino;

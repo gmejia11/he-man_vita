@@ -37,7 +37,18 @@ void gl_preload() {
 }
 
 void gl_init() {
+    // Bigger GXM ring buffers than the SceGxm defaults (VDM 128 KB, vertex
+    // 2 MB, fragment 512 KB): the game crashed inside SceGxm's ring buffer
+    // reservation when they ran out.
+    vglSetVDMBufferSize(1 * 1024 * 1024);
+    vglSetVertexBufferSize(4 * 1024 * 1024);
+    vglSetFragmentBufferSize(2 * 1024 * 1024);
+#if defined(USE_MSAA_4X) && !defined(VITA3K_NO_COLOR_CLEAR)
     vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
+#else
+    // No MSAA: much cheaper on the GPU, and Vita3K takes fewer code paths
+    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+#endif
 }
 
 void gl_swap() {

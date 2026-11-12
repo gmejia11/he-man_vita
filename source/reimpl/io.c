@@ -10,12 +10,14 @@
 #include "reimpl/io.h"
 
 #include <string.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <stdarg.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/clib.h>
 
 #ifdef USE_SCELIBC_IO
 #include <libc_bridge/libc_bridge.h>
@@ -30,11 +32,35 @@
 // void stat_newlib_to_bionic(struct stat * src, stat64_bionic * dst);
 #include "reimpl/bits/_struct_converters.c"
 
+void *ui_trace_files[8];
+
 FILE * fopen_soloader(const char * filename, const char * mode) {
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
         return fopen_soloader("app0:/cpuinfo", mode);
     } else if (strcmp(filename, "/proc/meminfo") == 0) {
         return fopen_soloader("app0:/meminfo", mode);
+    }
+
+    // On Linux/Android, fopen() of a directory in read-only mode succeeds and
+    // reads return nothing; the Vita refuses it. Emulate the Android behavior
+    // with an empty stub file.
+    if (!strpbrk(mode, "wa+")) {
+        struct stat st;
+        if (stat(filename, &st) == 0 && S_ISDIR(st.st_mode)) {
+            sceClibPrintf("[io] fopen(%s, %s): directory, returning empty stream\n", filename, mode);
+            filename = DATA_PATH ".dir_stub";
+            FILE *stub = fopen(filename, "wb"); // make sure it exists and is empty
+            if (stub) fclose(stub);
+        }
+    }
+
+    // The game sometimes writes a file with an empty name ("<dir>/"), e.g. the
+    // rating prompter's save. fopen() would return NULL and the game writes to
+    // it without checking, so give it a throwaway file instead.
+    size_t len = strlen(filename);
+    if (strpbrk(mode, "wa+") && len > 0 && filename[len - 1] == '/') {
+        sceClibPrintf("[io] fopen(%s, %s): no file name, using throwaway file\n", filename, mode);
+        filename = DATA_PATH ".unnamed_write";
     }
 
 #ifdef USE_SCELIBC_IO
@@ -43,10 +69,27 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     FILE* ret = fopen(filename, mode);
 #endif
 
+    if (ret && strstr(filename, ".ui")) {
+        static int slot = 0;
+        extern void game_log_file(const char *tag, const char *text);
+        ui_trace_files[slot++ & 7] = ret;
+        char msg[320];
+        snprintf(msg, sizeof(msg), "fopen(%s, %s) = %p", filename, mode, ret);
+        game_log_file("uiio", msg);
+    }
     if (ret)
         l_debug("fopen(%s, %s): %p", filename, mode, ret);
-    else
-        l_warn("fopen(%s, %s): %p", filename, mode, ret);
+    else {
+        sceClibPrintf("[io] fopen(%s, %s) failed\n", filename, mode);
+        // The game always tries SaveData/ before the asset bundle; only log
+        // the misses that aren't that first, expected probe.
+        if (!strstr(filename, "/SaveData/")) {
+            extern void game_log_file(const char *tag, const char *text);
+            char msg[320];
+            snprintf(msg, sizeof(msg), "fopen(%s, %s) FAILED", filename, mode);
+            game_log_file("io", msg);
+        }
+    }
 
     return ret;
 }

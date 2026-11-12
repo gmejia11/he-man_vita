@@ -11,9 +11,9 @@ project(so_loader C CXX)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 # Vita application configuration
-set(VITA_APP_NAME "so-loader")
-set(VITA_TITLEID "SLDR00000")
-set(VITA_VPKNAME "so_loader")
+set(VITA_APP_NAME "He-Man")
+set(VITA_TITLEID "HEMAN0001")
+set(VITA_VPKNAME "heman")
 set(VITA_VERSION "01.00")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
@@ -22,12 +22,41 @@ set(PSVITAIP "192.168.0.198" CACHE STRING "PSVita IP (for FTP access)")
 set(PARSECOREPATH "$ENV{PARSECOREPATH}" CACHE STRING "vita-parse-core main.py")
 
 # Game-specific definitions
-set(DATA_PATH "ux0:data/gamename/") # Path to data (with trailing /)
-set(SO_PATH "${DATA_PATH}main.so") # Path to .so
+set(DATA_PATH "ux0:data/heman/") # Path to data (with trailing /)
+set(SO_PATH "${DATA_PATH}libnative-activity.so") # Path to .so
+set(OBB_PATH "${DATA_PATH}main.obb")
 add_definitions(-DDATA_PATH="${DATA_PATH}" -DSO_PATH="${SO_PATH}")
 
+# Emulator workarounds (turn OFF for builds meant for real hardware)
+option(VITA3K_WORKAROUNDS "Skip color-only glClear, which crashes Vita3K (turn OFF for real hardware)" ON)
+if (VITA3K_WORKAROUNDS)
+  add_definitions(-DVITA3K_NO_COLOR_CLEAR)
+endif()
+
+# Diagnostic: write-protect the heap page that keeps getting corrupted
+# Off by default: the corruption it hunted (WStringBuffer overflow) is fixed by
+# scratch_buffer_patch(), and its per-frame 128 KB scan + malloc wrappers cost FPS
+option(HEAP_WATCH "Make the corrupted vitaGL heap page read-only to catch the writer" OFF)
+if (HEAP_WATCH)
+  add_definitions(-DHEAP_WATCH)
+  set(HEAP_WATCH_WRAPS -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=memalign)
+endif()
+
+# 4x MSAA costs a lot of GPU time at 960x544 and makes the frame rate jump
+# between 60 and 30-40 fps; off by default
+option(MSAA_4X "Render with 4x MSAA" OFF)
+if (MSAA_4X)
+  add_definitions(-DUSE_MSAA_4X)
+endif()
+
+# Frame profiler: writes ux0:data/heman/perf.txt (see source/reimpl/perf.c)
+option(PERF_LOG "Log frame times and slow-frame causes to perf.txt" OFF)
+if (PERF_LOG)
+  add_definitions(-DPERF_LOG)
+endif()
+
 # Port type
-option(NDK_PORT "This should be on if the game is done with Android NDK (has an android_main entry point)" OFF)
+option(NDK_PORT "This should be on if the game is done with Android NDK (has an android_main entry point)" ON)
 if (NDK_PORT)
   add_definitions(-DNDK_PORT)
 endif()
@@ -73,10 +102,12 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   #add_definitions(-DDEBUG_PIPEFD=1)
   #add_definitions(-DDEBUG_CALLBACKS=1)
   # Space-separated flags passed to vitaGL
-  set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 TEST=1 LOG_ERRORS=1")
+  set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 TEST=1 LOG_ERRORS=1 NO_SPLASHSCREEN=1 HAVE_SHADER_CACHE=1")
 else()
   # Space-separated flags passed to vitaGL
-  set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1")
+  # HAVE_SHADER_CACHE: keep compiled GLSL shaders in ux0:data/shader_cache so
+  # shacccg doesn't stall a frame every time the game meets a new shader
+  set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 NO_SPLASHSCREEN=1 HAVE_SHADER_CACHE=1")
 endif()
 
 # makes sincos, sincosf, etc. visible
@@ -84,6 +115,11 @@ add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -mfloat-abi=softfp -std=gnu11 -Wno-deprecated")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q -mfloat-abi=softfp -std=gnu++20 -Wno-write-strings -Wno-psabi")
+
+# CMake appends CMAKE_<LANG>_FLAGS_<CONFIG> after these, and its Debug default
+# (-O0 -g) silently overrode the -O1 below
+set(CMAKE_C_FLAGS_DEBUG "")
+set(CMAKE_CXX_FLAGS_DEBUG "")
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O1 -g3")
@@ -100,6 +136,13 @@ set(SOURCES
     source/patch.c
     source/reimpl/bits/_ctype.c
     source/reimpl/errno.c
+    source/reimpl/gxm_guard.c
+    source/reimpl/audio_guard.c
+    source/reimpl/touch_buttons.c
+    source/reimpl/perf.c
+    source/reimpl/memfile.c
+    source/reimpl/sound_fix.c
+    source/reimpl/heapwatch.c
     source/reimpl/io.c
     source/reimpl/log.c
     source/reimpl/mem.c
@@ -190,6 +233,11 @@ if(NDK_PORT)
 endif()
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
+                      ${HEAP_WATCH_WRAPS}
+                      -Wl,--wrap=sceGxmSetUniformDataF
+                      -Wl,--wrap=sceGxmBeginScene -Wl,--wrap=sceGxmEndScene -Wl,--wrap=sceGxmDraw -Wl,--wrap=sceGxmDisplayQueueAddEntry
+                      -Wl,--wrap=sceGxmReserveVertexDefaultUniformBuffer -Wl,--wrap=sceGxmReserveFragmentDefaultUniformBuffer
+                      -Wl,--wrap=sceAudioOutOpenPort -Wl,--wrap=sceAudioOutSetConfig -Wl,--wrap=sceAudioOutOutput
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       OpenSLES
                       sndfile
@@ -238,11 +286,11 @@ vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 FILE ${CMAKE_SOURCE_DIR}/extras/cpuinfo cpuinfo
                 ${CMAKE_SOURCE_DIR}/extras/meminfo meminfo
                 ${CMAKE_SOURCE_DIR}/extras/urandom urandom
-                ${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png sce_sys/icon0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png sce_sys/pic0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/startup.png sce_sys/livearea/contents/startup.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png sce_sys/livearea/contents/bg0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/template.xml sce_sys/livearea/contents/template.xml
+                ${CMAKE_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/pic0.png sce_sys/pic0.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/bg0.png sce_sys/livearea/contents/bg0.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
                 )
 
 add_custom_target(send

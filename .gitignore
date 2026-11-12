@@ -4,3 +4,12 @@ build/*
 cmake-build-*/
 lib/libc_bridge/out/
 apk/
+build-debug/
+*.so
+*.obb
+*.pak
+*.jpg
+!sce_sys/**/*.jpg
+!docs/**/*.jpg
+assets/
+lib/vitagl/samples/

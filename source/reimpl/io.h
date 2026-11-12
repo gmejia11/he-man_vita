@@ -19,6 +19,7 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/dirent.h>
 #include <sys/syslimits.h>
@@ -40,24 +41,28 @@ extern "C" {
 #define DT_WHT 14
 #endif
 
-typedef struct __attribute__((__packed__)) stat64_bionic {
-    unsigned long long st_dev;
-    unsigned char __pad0[4];
-    unsigned long __st_ino;
-    unsigned int st_mode;
-    nlink_t st_nlink;
-    uid_t st_uid;
-    gid_t st_gid;
-    unsigned long long st_rdev;
-    unsigned char __pad3[4];
-    long long st_size;
-    unsigned long st_blksize;
-    unsigned long long st_blocks;
-    struct timespec st_atim;
-    struct timespec st_mtim;
-    struct timespec st_ctim;
-    unsigned long long st_ino;
+// bionic's 32-bit ARM `struct stat` (== stat64): 104 bytes, natural alignment.
+// Fixed-width types on purpose: newlib's nlink_t/uid_t/gid_t/timespec differ.
+typedef struct { int32_t tv_sec; int32_t tv_nsec; } timespec_bionic;
+typedef struct stat64_bionic {
+    uint64_t st_dev;          // 0
+    uint8_t  __pad0[4];       // 8
+    uint32_t __st_ino;        // 12
+    uint32_t st_mode;         // 16
+    uint32_t st_nlink;        // 20
+    uint32_t st_uid;          // 24
+    uint32_t st_gid;          // 28
+    uint64_t st_rdev;         // 32
+    uint8_t  __pad3[4];       // 40
+    int64_t  st_size;         // 48
+    uint32_t st_blksize;      // 56
+    uint64_t st_blocks;       // 64
+    timespec_bionic st_atim;  // 72
+    timespec_bionic st_mtim;  // 80
+    timespec_bionic st_ctim;  // 88
+    uint64_t st_ino;          // 96
 } stat64_bionic;
+_Static_assert(sizeof(stat64_bionic) == 104, "bionic struct stat must be 104 bytes");
 
 typedef struct __attribute__((__packed__)) dirent64_bionic {
     int16_t d_ino; // 2 bytes // offset 0x0

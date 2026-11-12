@@ -37,6 +37,8 @@ AAssetManager * AAssetManager_create() {
     return g_AAssetManager;
 }
 
+extern "C" void game_log_file(const char *tag, const char *text);
+
 AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     std::string realp = std::string(DATA_PATH) + std::string("assets/") + std::string(filename);
 
@@ -69,6 +71,11 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     }
 
     l_debug("AAssetManager_open<%p>(%p, %s, %i): %p", __builtin_return_address(0), mgr, realp.c_str(), mode, a);
+    if (!a) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "AAssetManager_open(%s) FAILED", filename);
+        game_log_file("asset", msg);
+    }
     return (AAsset *) a;
 }
 
